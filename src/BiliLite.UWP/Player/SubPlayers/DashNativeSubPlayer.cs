@@ -462,6 +462,15 @@ namespace BiliLite.Player.SubPlayers
                 m_mediaPlayer.PlaybackSession.BufferingProgressChanged -= PlaybackSessionOnBufferingProgressChanged;
                 m_mediaPlayer.PlaybackSession.BufferingEnded -= PlaybackSessionOnBufferingEnded;
                 m_mediaPlayer.PlaybackSession.PositionChanged -= PlaybackSessionOnPositionChanged;
+            }
+
+            await RunOnUiThreadAsync(() =>
+            {
+                m_playerElement?.SetMediaPlayer(null);
+            });
+
+            if (m_mediaPlayer != null)
+            {
                 m_mediaPlayer.Dispose();
                 m_mediaPlayer = null;
             }
@@ -478,7 +487,6 @@ namespace BiliLite.Player.SubPlayers
                     return;
                 }
 
-                m_playerElement.SetMediaPlayer(null);
                 if (!detachElement)
                 {
                     return;
