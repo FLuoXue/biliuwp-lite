@@ -1,0 +1,131 @@
+name: Build signed package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version (four numeric parts)
+        required: true
+        default: "4.6.5.0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      SIGNING_CERTIFICATE_PASSWD: ${{ secrets.SIGNING_CERTIFICATE_PASSWD }}
+      WEBDAV_ADDR: ${{ secrets.WEBDAV_ADDR }}
+      WEBDAV_AUTH: ${{ secrets.WEBDAV_AUTH }}
+      NUGET_PACKAGE_ADDR: ${{ secrets.NUGET_PACKAGE_ADDR }}
+
+    steps:
+      - name: Configure pagefile
+        uses: al-cheb/configure-pagefile-action@v1.2
+        with:
+          minimum-size: 64GB
+          maximum-size: 64GB
+          disk-root: "C:"
+
+      - name: Checkout selected branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download signing certificate and NuGet cache
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in 'SIGNING_CERTIFICATE_PASSWD', 'WEBDAV_ADDR', 'WEBDAV_AUTH', 'NUGET_PACKAGE_ADDR') {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Required Actions secret is missing: $name"
+            }
+          }
+
+          $projectDir = Join-Path $env:GITHUB_WORKSPACE 'src/BiliLite.Packages'
+          $certificate = Join-Path $projectDir 'BiliLite.UWP_TemporaryKey.pfx'
+          $nugetArchive = Join-Path $env:RUNNER_TEMP 'biliuwp-lite-nuget-packages.zip'
+
+          curl.exe --fail --location --insecure "$env:WEBDAV_ADDR" --header "$env:WEBDAV_AUTH" --output $certificate
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download signing certificate' }
+          curl.exe --fail --location --insecure "$env:NUGET_PACKAGE_ADDR" --header "$env:WEBDAV_AUTH" --output $nugetArchive
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download NuGet package cache' }
+
+          $securePassword = ConvertTo-SecureString $env:SIGNING_CERTIFICATE_PASSWD -AsPlainText -Force
+          $pfx = Get-PfxData -FilePath $certificate -Password $securePassword
+          $signingCert = $pfx.EndEntityCertificates[0]
+          if ($signingCert.Subject -ne 'CN=muyan') {
+            throw 'Signing certificate subject must match the package publisher CN=muyan'
+          }
+          "PACKAGE_CERTIFICATE_THUMBPRINT=$($signingCert.Thumbprint)" >> $env:GITHUB_ENV
+
+          Expand-Archive -Path $nugetArchive -DestinationPath $env:GITHUB_WORKSPACE -Force
+          if (-not (Test-Path (Join-Path $env:GITHUB_WORKSPACE 'packages'))) {
+            throw 'NuGet cache archive did not contain a packages directory'
+          }
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE 'packages') (Join-Path $env:GITHUB_WORKSPACE 'src/packages') -Recurse -Force
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v1.0.3
+
+      - name: Set up Windows SDK
+        uses: GuillaumeFalourd/setup-windows10-sdk-action@v2.4
+        with:
+          sdk-version: 19041
+
+      - name: Set package version
+        shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:PACKAGE_VERSION -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+            throw 'Version must contain four numeric parts, for example 4.6.5.0'
+          }
+          $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'src/BiliLite.Packages/Package.appxmanifest'
+          [xml]$manifest = Get-Content -LiteralPath $manifestPath
+          $manifest.Package.Identity.Version = $env:PACKAGE_VERSION
+          $manifest.Save($manifestPath)
+
+      - name: Build signed x64 package
+        id: build
+        shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $certificate = Join-Path $env:GITHUB_WORKSPACE 'src/BiliLite.Packages/BiliLite.UWP_TemporaryKey.pfx'
+          $arguments = @(
+            'src/BiliLite.Packages',
+            '/p:Platform=x64',
+            '/p:Configuration=Release',
+            '/p:BuildMode=SideloadOnly',
+            "/p:PackageCertificateKeyFile=$certificate",
+            "/p:PackageCertificatePassword=$env:SIGNING_CERTIFICATE_PASSWD",
+            "/p:PackageCertificateThumbprint=$env:PACKAGE_CERTIFICATE_THUMBPRINT",
+            '/restore'
+          )
+          & msbuild @arguments
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE" }
+
+          $packageDir = Join-Path $env:GITHUB_WORKSPACE "src/BiliLite.Packages/AppPackages/BiliLite.Packages_$($env:PACKAGE_VERSION)_x64_Test"
+          if (-not (Test-Path -LiteralPath $packageDir)) {
+            throw "Expected package output was not created: $packageDir"
+          }
+          "artifact_path=$packageDir" >> $env:GITHUB_OUTPUT
+
+      - name: Upload signed package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BiliLite.Packages-${{ inputs.version }}-x64
+          path: ${{ steps.build.outputs.artifact_path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove signing certificate
+        if: always()
+        shell: pwsh
+        run: Remove-Item -LiteralPath 'src/BiliLite.Packages/BiliLite.UWP_TemporaryKey.pfx' -Force -ErrorAction SilentlyContinue
