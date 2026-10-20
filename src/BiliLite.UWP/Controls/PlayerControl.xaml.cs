@@ -2753,6 +2753,8 @@ namespace BiliLite.Controls
                     _ = m_videoPlayer.SetRatioMode(PlayerSettingRatio.SelectedIndex);
                     break;
                 case PlayState.Playing:
+                    // Autoplay bypasses Play(), but must enable the same history reporting.
+                    m_firstMediaPlayed = true;
                     VideoLoading.Visibility = Visibility.Collapsed;
                     m_autoRefreshTimer?.Start();
                     KeepScreenOn(true);
